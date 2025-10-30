@@ -3,15 +3,17 @@ import time
 import redis
 import numpy as np
 import fitz  # PyMuPDF
+import torch
 from sentence_transformers import SentenceTransformer
 from redis.commands.search.field import VectorField, TextField
 from redis.commands.search.index_definition import IndexDefinition, IndexType
 from redis.commands.search.query import Query
+from sentence_transformers import CrossEncoder
 
 # -----------------------------
 # Step 1: Read PDF
 # -----------------------------
-PDF_PATH = "/home/sakib/Desktop/test.pdf"
+PDF_PATH = "data/banglaTest.pdf"
 doc = fitz.open(PDF_PATH)
 
 pdf_texts = []
@@ -42,8 +44,21 @@ print(f"✅ Total chunks: {len(all_chunks)}")
 # -----------------------------
 # Step 3: Generate embeddings
 # -----------------------------
-model = SentenceTransformer('all-MiniLM-L6-v2')
-embeddings = model.encode(all_chunks)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print("Using device:", device)
+
+model = SentenceTransformer('BAAI/bge-m3', device=device)
+
+print(torch.cuda.memory_allocated() / 1024**2, "MB allocated")
+print(torch.cuda.memory_reserved() / 1024**2, "MB reserved")
+
+embeddings = model.encode(
+    all_chunks,
+    batch_size=2,
+    show_progress_bar=True,
+    device=device
+)
+
 VECTOR_DIM = len(embeddings[0])
 print(f"✅ Generated embeddings of size {VECTOR_DIM}")
 
@@ -64,7 +79,7 @@ r.ft(INDEX_NAME).create_index(
         VectorField(
             "embedding",
             "FLAT",
-            {"TYPE": "FLOAT32", "DIM": VECTOR_DIM, "DISTANCE_METRIC": "COSINE"}
+            {"TYPE": "FLOAT16", "DIM": VECTOR_DIM, "DISTANCE_METRIC": "COSINE"}
         )
     ],
     definition=IndexDefinition(prefix=["chunk:"], index_type=IndexType.HASH)
@@ -77,7 +92,7 @@ start_time = time.time()
 for i, emb in enumerate(embeddings):
     r.hset(f"chunk:{i}", mapping={
         "content": all_chunks[i],
-        "embedding": np.array(emb, dtype=np.float32).tobytes()
+        "embedding": np.array(emb, dtype=np.float16).tobytes()
     })
 end_time = time.time()
 insertion_time = end_time - start_time
@@ -93,26 +108,30 @@ print(f"✅ Stored {len(all_chunks)} chunks in Redis")
 # Step 6: Queries and retrieval
 # -----------------------------
 queries = [
-    "What is the capital of Bangladesh?",
-    "Which rivers form the delta of Bangladesh?",
-    "When did Bangladesh gain independence?",
-    "What is the official language of Bangladesh?",
-    "Name two major religious festivals in Bangladesh."
+    # "What did the person wear while farming?"
+    # "বাংলাদেশের রাজধানী কোন শহর?",
+    # "বাংলাদেশের স্বাধীনতা কখন অর্জিত হয়েছিল?",
+    # "বাংলাদেশের প্রধান রফতানি খাত কোনটি?",
+    # "বাংলাদেশের পদ্মা সেতু কোন ধরনের প্রতীক হিসেবে পরিচিত?",
+    # "বাংলাদেশের সবচেয়ে বড় ধর্মীয় উৎসবগুলো কী কী?"
+    "বাংলাদেশ কবে মুক্তি পায়?"
 ]
 
-TOP_K = 2  # retrieve top 3 relevant chunks
+TOP_K = 3  # retrieve top 3 relevant chunks
 total_query_time = 0
 
 for query_text in queries:
-    q_emb = model.encode([query_text])[0]
-    q_vector = np.array(q_emb, dtype=np.float32).tobytes()
+    query_start = time.time()
+
+    q_emb = model.encode([query_text], device=device)[0]
+
+    q_vector = np.array(q_emb, dtype=np.float16).tobytes()
 
     q = Query(f"*=>[KNN {TOP_K} @embedding $vector AS score]") \
         .return_fields("content", "score") \
         .sort_by("score", asc=True) \
         .paging(0, TOP_K)
 
-    query_start = time.time()
     results = r.ft(INDEX_NAME).search(q, query_params={"vector": q_vector})
     query_end = time.time()
 
@@ -123,6 +142,61 @@ for query_text in queries:
 
     for rank, doc in enumerate(results.docs, start=1):
         print(f"({float(doc.score):.4f}). {doc.content} ")
+
+avg_latency = total_query_time / len(queries)
+query_throughput = len(queries) / total_query_time
+
+print("\n📊 Query Metrics")
+print(f"✅ Average query latency: {avg_latency:.4f} seconds")
+print(f"✅ Query throughput: {query_throughput:.2f} queries/sec")
+
+
+# -----------------------------
+# Step 6b: Initialize BGE reranker
+# -----------------------------
+reranker = CrossEncoder("BAAI/bge-reranker-v2-m3", device=device)
+print("✅ Loaded BGE reranker")
+
+# -----------------------------
+# Step 6c: Rerank retrieved chunks
+# -----------------------------
+
+total_query_time=0
+
+for query_text in queries:
+    query_start = time.time()
+
+    q_emb = model.encode([query_text], device=device)[0]
+    q_vector = np.array(q_emb, dtype=np.float16).tobytes()
+
+    q = Query(f"*=>[KNN {TOP_K} @embedding $vector AS score]") \
+        .return_fields("content", "score") \
+        .sort_by("score", asc=True) \
+        .paging(0, TOP_K)
+
+    results = r.ft(INDEX_NAME).search(q, query_params={"vector": q_vector})
+
+    # Prepare (query, doc) pairs for reranking
+    rerank_inputs = [(query_text, doc.content) for doc in results.docs]
+
+    # Rerank
+    rerank_scores = reranker.predict(rerank_inputs)
+
+    # Combine docs with rerank scores
+    reranked_results = sorted(
+        zip(results.docs, rerank_scores),
+        key=lambda x: x[1],  # sort by reranker score descending
+        reverse=True
+    )
+
+    query_end = time.time()
+
+    query_latency = query_end - query_start
+    total_query_time += query_latency
+
+    print(f"\n✅ Query: {query_text} (after reranking)")
+    for rank, (doc, score) in enumerate(reranked_results, start=1):
+        print(f"{rank}. ({score:.4f}) {doc.content}")
 
 avg_latency = total_query_time / len(queries)
 query_throughput = len(queries) / total_query_time
