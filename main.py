@@ -100,6 +100,7 @@ else:
         definition=IndexDefinition(prefix=["chunk:"], index_type=IndexType.HASH)
     )
 
+
     # Store chunks in Redis
     start_time = time.time()
     for i, emb in enumerate(embeddings):
