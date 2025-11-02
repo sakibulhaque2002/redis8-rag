@@ -1,14 +1,9 @@
-# imports
 import time
 import redis
-import numpy as np
 import fitz
-import torch
-from sentence_transformers import SentenceTransformer
 from redis.commands.search.field import VectorField, TextField
 from redis.commands.search.index_definition import IndexDefinition, IndexType
 from redis.commands.search.query import Query
-from sentence_transformers import CrossEncoder
 from openai import OpenAI
 import numpy as np
 from typing import Dict, Any
@@ -17,8 +12,10 @@ from typing import Dict, Any
 embedding_client = OpenAI(base_url="http://localhost:8001/v1", api_key="EMPTY")
 reranker_client = OpenAI(base_url="http://localhost:8002", api_key="EMPTY")
 
+
 #Chunking function
-def chunk_full_text(text, max_words=50, overlap=10):
+def chunk_full_text(text, max_words=2000, overlap=100):
+    print(f"Maximum words in each chunk: {max_words}")
     words = text.split()
     chunks = []
     start = 0
@@ -30,7 +27,7 @@ def chunk_full_text(text, max_words=50, overlap=10):
     return chunks
 
 # Device selection
-device = "cuda" if torch.cuda.is_available() else "cpu"
+device = "cuda"
 print("Using device:", device)
 
 # Embedding function using model
@@ -59,9 +56,18 @@ def is_index_populated(redis_client, index_name):
 
 # Redis connection
 r = redis.Redis(host='localhost', port=6379, decode_responses=False)
+INDEX_NAME = "pdf_chunked_idx"
+
+# Ask user if they want a fresh database
+user_input = input("Do you want to use a fresh database? (y/n): ").strip().lower()
+if user_input == 'y':
+    chunk_size=int(input("Enter the chunk size: "))
+    r.ft(INDEX_NAME).dropindex(delete_documents=True)
+    print(f"✅ Existing index and documents deleted. Fresh database ready.")
+else:
+    print("✅ Using existing database and index.")
 
 # Checking the persistence of Redis
-INDEX_NAME = "pdf_chunked_idx"
 if index_exists(r, INDEX_NAME) and is_index_populated(r, INDEX_NAME):
     print("✅ Existing Redis index found — skipping PDF re-embedding.")
 else:
@@ -73,7 +79,7 @@ else:
     full_text = " ".join([page.get_text().replace("\n", " ") for page in doc])
 
     # Creating chunks
-    all_chunks = chunk_full_text(full_text)
+    all_chunks = chunk_full_text(full_text, max_words=chunk_size)
     print(f"✅ Total chunks: {len(all_chunks)}")
 
     # Generating embeddings
