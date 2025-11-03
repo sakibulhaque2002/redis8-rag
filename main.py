@@ -7,11 +7,12 @@ from redis.commands.search.query import Query
 from openai import OpenAI
 import numpy as np
 from typing import Dict, Any
+from qdrant_client import QdrantClient
+from qdrant_client.http.models import VectorParams
 
 # Connect to vLLM servers
 embedding_client = OpenAI(base_url="http://localhost:8001/v1", api_key="EMPTY")
 reranker_client = OpenAI(base_url="http://localhost:8002", api_key="EMPTY")
-
 
 #Chunking function
 def chunk_full_text(text, max_words=2000, overlap=100):
@@ -38,7 +39,7 @@ def get_embeddings(texts):
     )
     return [np.array(r.embedding, dtype=np.float16) for r in response.data]
 
-# Checking the existence of DB
+# Checking the existence of redis db
 def index_exists(redis_client, index_name):
     try:
         redis_client.ft(index_name).info()
@@ -46,32 +47,60 @@ def index_exists(redis_client, index_name):
     except Exception:
         return False
 
-# Checking the emptiness of DB
-def is_index_populated(redis_client, index_name):
+# Checking the existence of qdrant db
+def collection_exists(client: QdrantClient, name: str) -> bool:
     try:
-        info = redis_client.ft(index_name).info()
-        return info.get("num_docs", 0) > 0
+        client.get_collection(name)
+        return True
     except Exception:
         return False
 
+# # Checking the emptiness of DB
+# def is_index_populated(redis_client, index_name):
+#     try:
+#         info = redis_client.ft(index_name).info()
+#         return info.get("num_docs", 0) > 0
+#     except Exception:
+#         return False
+
 # Redis connection
 r = redis.Redis(host='localhost', port=6379, decode_responses=False)
-INDEX_NAME = "pdf_chunked_idx"
+REDIS_INDEX = "pdf_chunked_idx"
+
+# Qdrant connection
+qclient = QdrantClient(host="localhost", port=6333)
+QDRANT_COLLECTION = "pdf_chunked_coll"
 
 # Ask user if they want a fresh database
-user_input = input("Do you want to use a fresh database? (y/n): ").strip().lower()
+user_input = input("Do you want to use a fresh database for both Redis and Qdrant? (y/n): ").strip().lower()
 if user_input == 'y':
-    chunk_size=int(input("Enter the chunk size: "))
-    r.ft(INDEX_NAME).dropindex(delete_documents=True)
-    print(f"✅ Existing index and documents deleted. Fresh database ready.")
+    chunk_size = int(input("Enter chunk size: "))
+
+    try:
+        r.ft(REDIS_INDEX).dropindex(delete_documents=True)
+        print("✅ Existing Redis index and documents deleted.")
+    except Exception:
+        print("No existing Redis index found.")
+
+    try:
+        qclient.delete_collection(collection_name=QDRANT_COLLECTION)
+        print("✅ Existing Qdrant collection deleted.")
+    except Exception:
+        print("No existing Qdrant collection found.")
+
 else:
-    print("✅ Using existing database and index.")
+    print("✅ Using existing databases.")
 
 # Checking the persistence of Redis
-if index_exists(r, INDEX_NAME) and is_index_populated(r, INDEX_NAME):
+# if index_exists(r, REDIS_INDEX) and is_index_populated(r, REDIS_INDEX):
+if index_exists(r, REDIS_INDEX):
     print("✅ Existing Redis index found — skipping PDF re-embedding.")
-else:
-    print("⚙️ No existing Redis data found. Processing PDF and creating embeddings...")
+
+if collection_exists(qclient, QDRANT_COLLECTION):
+    print("✅ Qdrant collection found — skipping re-embedding.")
+
+if not index_exists(r, REDIS_INDEX) or not collection_exists(qclient, QDRANT_COLLECTION):
+
 
     # Read PDF
     PDF_PATH = "data/english.pdf"
@@ -87,41 +116,82 @@ else:
     VECTOR_DIM = len(embeddings[0])
     print(f"✅ Generated embeddings of size {VECTOR_DIM}")
 
-    # Creating index if DB does not exist
-    r.ft(INDEX_NAME).create_index(
-        fields=[
-            TextField("content"),
-            VectorField(
-                "embedding",
-                "FLAT",
-                {"TYPE": "FLOAT16", "DIM": VECTOR_DIM, "DISTANCE_METRIC": "COSINE"}
-            )
-        ],
-        definition=IndexDefinition(prefix=["chunk:"], index_type=IndexType.HASH)
-    )
+    if not index_exists(r, REDIS_INDEX):
+        print("⚙️ No existing Redis data found. Processing PDF and creating embeddings...")
+        # Creating redis index if DB does not exist
+        r.ft(REDIS_INDEX).create_index(
+            fields=[
+                TextField("content"),
+                VectorField(
+                    "embedding",
+                    "FLAT",
+                    {"TYPE": "FLOAT16", "DIM": VECTOR_DIM, "DISTANCE_METRIC": "COSINE"}
+                )
+            ],
+            definition=IndexDefinition(prefix=["chunk:"], index_type=IndexType.HASH)
+        )
+
+        # Store chunks in Redis
+        start_time = time.time()
+        for i, emb in enumerate(embeddings):
+            r.hset(f"chunk:{i}", mapping={
+                "content": all_chunks[i],
+                "embedding": np.array(emb, dtype=np.float16).tobytes()
+            })
+        end_time = time.time()
+        insertion_time = end_time - start_time
+        insertion_throughput = len(embeddings) / insertion_time
+
+        print("\n📊 Redis Insertion Metrics")
+        print(f"✅ Total insertion time: {insertion_time:.4f} seconds")
+        print(f"✅ Insertion throughput: {insertion_throughput:.2f} embeddings/sec")
 
 
-    # Store chunks in Redis
-    start_time = time.time()
-    for i, emb in enumerate(embeddings):
-        r.hset(f"chunk:{i}", mapping={
-            "content": all_chunks[i],
-            "embedding": np.array(emb, dtype=np.float16).tobytes()
-        })
-    end_time = time.time()
-    insertion_time = end_time - start_time
-    insertion_throughput = len(embeddings) / insertion_time
+    if not collection_exists(qclient, QDRANT_COLLECTION):
+        print("⚙️ No Qdrant collection found — will process PDF and create embeddings.")
 
-    print("\n📊 Insertion Metrics")
-    print(f"✅ Total insertion time: {insertion_time:.4f} seconds")
-    print(f"✅ Insertion throughput: {insertion_throughput:.2f} embeddings/sec")
+        VECTOR_DIM = len(embeddings[0])
+        qclient.create_collection(
+            collection_name=QDRANT_COLLECTION,
+            vectors_config=VectorParams(size=VECTOR_DIM, distance="Cosine")
+        )
+
+
+        batch_size = 128
+        total_points = len(embeddings)
+        start_time = time.time()
+        for batch_start in range(0, total_points, batch_size):
+            batch_end = min(batch_start + batch_size, total_points)
+            points = [
+                {
+                    "id": i,
+                    "vector": np.array(embeddings[i], dtype=np.float16).tolist(),
+                    "payload": {"content": all_chunks[i]}
+                }
+                for i in range(batch_start, batch_end)
+            ]
+            qclient.upsert(collection_name=QDRANT_COLLECTION, points=points)
+        end_time = time.time()
+
+        insertion_time = end_time - start_time
+        throughput = total_points / insertion_time
+        print("\n📊 Qdrant Insertion Metrics")
+        print(f"✅ Total insertion time: {insertion_time:.4f}s")
+        print(f"✅ Insertion throughput: {throughput:.2f} embeddings/sec")
 
 # List of Queries
 queries = [
-    "Where was Charles KingsIey born?",
-    "What was the institution where Walter de la Mare studied?",
-    "When did Anne die?"
+    # "Where was Charles KingsIey born?",
+    # "What was the institution where Walter de la Mare studied?",
+    # "When did Anne die?",
+    # "When did Emily visited Brussels?",
+    "After how many attempts did Benjamin succeed in gaining a seat in Parliament?",
+    "What happened in 1604 at Hampton Court?",
+    "What caused the end of his medical career?"
 ]
+
+# user_input = input("Enter your queries (separated by commas): ")
+# queries = [q.strip() for q in user_input.split(",") if q.strip()]
 
 # Reranking function using model
 def rerank(query, docs):
@@ -142,35 +212,81 @@ def rerank(query, docs):
     return scores
 
 # Top k elements retrieval
-TOP_K = 3
-total_query_time = 0
-total_rerank_time = 0
+TOP_K = 10
 
+# --- Redis querying metrics collection ---
+total_query_time_redis = 0.0
+total_rerank_time_redis = 0.0
+
+# --- Qdrant querying metrics collection ---
+total_query_time_qdrant = 0.0
+total_rerank_time_qdrant = 0.0
+
+print("\n\n===== Running queries for Redis and Qdrant (with reranking) =====")
 # Generating results for each query
-for query_text in queries:
-    query_start = time.time()
+# for query_text in queries:
+for qi, query_text in enumerate(queries):
+
     q_emb = get_embeddings([query_text])[0]
     q_vector = np.array(q_emb, dtype=np.float16).tobytes()
 
+    # --- Qdrant search ---
+    # q_emb = np.array(query_embeddings[qi], dtype=np.float16).tolist()
+    q_list = np.array(q_emb, dtype=np.float16).tolist()
+
+    q_start = time.time()
+    results = qclient.query_points(
+        collection_name=QDRANT_COLLECTION,
+        query=q_list,
+        limit=TOP_K,
+        with_payload=True
+    )
+    q_end = time.time()
+    q_latency = q_end - q_start
+    total_query_time_qdrant += q_latency
+
+    print(f"\n🔎 Qdrant Query: {query_text} (latency: {q_latency:.4f}s)")
+    qdrant_docs = []
+    for result in results:
+        for points in result[1]:
+            doc_text = points.payload["content"]
+            qdrant_docs.append(doc_text)
+            print(f"({points.score:.4f}). {doc_text}")
+
+    # Rerank for Qdrant
+    rerank_start = time.time()
+    rerank_scores_q = rerank(query_text, qdrant_docs)
+    reranked_q = sorted(zip(qdrant_docs, rerank_scores_q), key=lambda x: x[1], reverse=True)
+    rerank_end = time.time()
+    rerank_time_q = rerank_end - rerank_start
+    total_rerank_time_qdrant += rerank_time_q
+
+    print(f"\n✅ Qdrant Query: {query_text} (after reranking)")
+    for rank, (doc, score) in enumerate(reranked_q, start=1):
+        print(f"  {rank}. ({score:.4f}) {doc}")
+
+    # --- Redis search ---
+
+    query_start = time.time()
     # Cosine similarity search
     q = Query(f"*=>[KNN {TOP_K} @embedding $vector AS score]") \
         .return_fields("content", "score") \
         .sort_by("score", asc=True) \
         .paging(0, TOP_K)
-    results = r.ft(INDEX_NAME).search(q, query_params={"vector": q_vector})
+    results = r.ft(REDIS_INDEX).search(q, query_params={"vector": q_vector})
 
     query_end = time.time()
     query_latency = query_end - query_start
-    total_query_time += query_latency
+    total_query_time_redis += query_latency
 
     print(f"\n🔍 Query: {query_text} (latency: {query_latency:.4f}s)")
     for rank, doc in enumerate(results.docs, start=1):
         print(f"({float(doc.score):.4f}). {doc.content} ")
 
+    # Rerank for redis
 
-    # Rerank
-    rerank_start = time.time()
     documents = [doc.content for doc in results.docs]
+    rerank_start = time.time()
     rerank_scores = rerank(query_text, documents)
     reranked_results = sorted(
         zip(results.docs, rerank_scores),
@@ -179,25 +295,52 @@ for query_text in queries:
     )
     rerank_end = time.time()
     rerank_time = rerank_end - rerank_start
-    total_rerank_time += rerank_time
+    total_rerank_time_redis += rerank_time
 
-    print(f"\n✅ Query: {query_text} (after reranking)")
+    print(f"\n✅ Redis Query: {query_text} (after reranking)")
     for rank, (doc, score) in enumerate(reranked_results, start=1):
-        print(f"{rank}. ({score:.4f}) {doc.content}")
+        print(f"  {rank}. ({score:.4f}) {doc.content}")
 
-avg_query_latency = total_query_time / len(queries)
-avg_rerank_latency = total_rerank_time / len(queries)
-avg_total_latency = (total_query_time + total_rerank_time) / len(queries)
 
-query_throughput = len(queries) / total_query_time
-rerank_throughput= len(queries) / total_rerank_time
-total_throughput = len(queries) / (total_query_time + total_rerank_time)
 
-print("\n📊 Query Metrics")
-print(f"✅ Average query latency: {avg_query_latency:.4f} seconds")
-print(f"✅ Average rerank latency: {avg_rerank_latency:.4f} seconds")
-print(f"✅ Average total latency: {avg_total_latency:.4f} seconds")
+
+
+
+
+
+# ---------- Final Metrics Calculation ----------
+# Redis
+avg_query_latency_redis = total_query_time_redis / len(queries)
+avg_rerank_latency_redis = total_rerank_time_redis / len(queries)
+avg_total_latency_redis = (total_query_time_redis + total_rerank_time_redis) / len(queries)
+query_throughput_redis = len(queries) / total_query_time_redis if total_query_time_redis > 0 else 0.0
+rerank_throughput_redis = len(queries) / total_rerank_time_redis if total_rerank_time_redis > 0 else 0.0
+total_throughput_redis = len(queries) / (total_query_time_redis + total_rerank_time_redis) if (total_query_time_redis + total_rerank_time_redis) > 0 else 0.0
+
+# Qdrant
+avg_query_latency_q = total_query_time_qdrant / len(queries)
+avg_rerank_latency_q = total_rerank_time_qdrant / len(queries)
+avg_total_latency_q = (total_query_time_qdrant + total_rerank_time_qdrant) / len(queries)
+query_throughput_q = len(queries) / total_query_time_qdrant if total_query_time_qdrant > 0 else 0.0
+rerank_throughput_q = len(queries) / total_rerank_time_qdrant if total_rerank_time_qdrant > 0 else 0.0
+total_throughput_q = len(queries) / (total_query_time_qdrant + total_rerank_time_qdrant) if (total_query_time_qdrant + total_rerank_time_qdrant) > 0 else 0.0
+
+# Print Redis metrics
+print("\n\n📊 Redis Query Metrics")
+print(f"✅ Average query latency: {avg_query_latency_redis:.4f} seconds")
+print(f"✅ Average rerank latency: {avg_rerank_latency_redis:.4f} seconds")
+print(f"✅ Average total latency: {avg_total_latency_redis:.4f} seconds")
 print()
-print(f"✅ Query throughput: {query_throughput:.2f} queries/sec")
-print(f"✅ Rerank throughput: {rerank_throughput:.2f} queries/sec")
-print(f"✅ Total throughput: {total_throughput:.2f} queries/sec")
+print(f"✅ Query throughput: {query_throughput_redis:.2f} queries/sec")
+print(f"✅ Rerank throughput: {rerank_throughput_redis:.2f} queries/sec")
+print(f"✅ Total throughput: {total_throughput_redis:.2f} queries/sec")
+
+# Print Qdrant metrics
+print("\n\n📊 Qdrant Query Metrics")
+print(f"✅ Average query latency: {avg_query_latency_q:.4f} seconds")
+print(f"✅ Average rerank latency: {avg_rerank_latency_q:.4f} seconds")
+print(f"✅ Average total latency: {avg_total_latency_q:.4f} seconds")
+print()
+print(f"✅ Query throughput: {query_throughput_q:.2f} queries/sec")
+print(f"✅ Rerank throughput: {rerank_throughput_q:.2f} queries/sec")
+print(f"✅ Total throughput: {total_throughput_q:.2f} queries/sec")
